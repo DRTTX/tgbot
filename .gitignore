@@ -24,3 +24,12 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+
+# secrets
+config.py
+.env
+*.env
+
+export/
+temp.py

@@ -1,435 +1,456 @@
 import os
 import logging
+from datetime import datetime
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
+    MessageHandler,
+    CallbackQueryHandler,
     CommandHandler,
-    ConversationHandler,
+    filters,
 )
 
-from config import BOT_TOKEN, STORAGE_PDF, STORAGE_TEMP
-from database import Database, UserRepo, FileRepo
+from config import BOT_TOKEN, STORAGE_TEMP, STORAGE_PDF, MAX_FILE_SIZE_MB
+from database import (
+    Database,
+    UserRepo,
+    FileRepo,
+    DraftRepo,
+    DraftItemRepo,
+)
 from services import PDFService
 from keyboards import (
-    lang_kb,
     main_menu,
-    collect_kb,
     files_list_kb,
     file_actions_kb,
-    merge_files_kb,
+    language_kb,
 )
 from texts import TEXT
-from ui import update_ui, reset_ui
-
-# ===================== LOGGER ===================
-
-import logging
-import sys
-
-class HumanFormatter(logging.Formatter):
-    COLORS = {
-        "INFO": "\033[92m",     # green
-        "WARNING": "\033[93m",  # yellow
-        "ERROR": "\033[91m",    # red
-        "RESET": "\033[0m",
-    }
-
-    def format(self, record):
-        color = self.COLORS.get(record.levelname, "")
-        reset = self.COLORS["RESET"]
-        record.levelname = f"{color}{record.levelname:<7}{reset}"
-        return super().format(record)
+from ui import show_ui, reset_ui, bump_ui, show_temp, delete_temp
 
 
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(
-    HumanFormatter(
-        "%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
+# ===================== LOGGING =====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
 )
 
-root = logging.getLogger()
-root.handlers.clear()
-root.addHandler(handler)
-root.setLevel(logging.INFO)
-
-# глушим шум
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-
-logging.info("🚀 Bot process initialized")
-
-
-def log_user(update: Update, action: str):
-    user = update.effective_user
-    uid = user.id if user else "unknown"
-    logging.info("👤 User %s %s", uid, action)
-
-
+log = logging.getLogger("bot")
 
 
 # ===================== INIT =====================
 
-os.makedirs(STORAGE_PDF, exist_ok=True)
 os.makedirs(STORAGE_TEMP, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO)
-
-(
-    LANG,
-    MENU,
-    COLLECT,
-    NAME,
-    FILES_MENU,
-    SETTINGS_MENU,
-    RENAME,
-    MERGE_SELECT,
-) = range(8)
+os.makedirs(STORAGE_PDF, exist_ok=True)
 
 db = Database()
 users = UserRepo(db)
 files = FileRepo(db)
+drafts = DraftRepo(db)
+draft_items = DraftItemRepo(db)
 
-# ===================== START =====================
+
+# ===================== HELPERS =====================
+
+def get_lang(user: dict) -> str:
+    return user.get("language", "en")
+
+
+def auto_name() -> str:
+    return f"Document {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+
+def is_supported_image(filename: str) -> bool:
+    return filename.lower().endswith((".jpg", ".jpeg", ".png", ".heic"))
+
+
+def is_supported_pdf(filename: str) -> bool:
+    return filename.lower().endswith(".pdf")
+
+
+def file_too_large(size_bytes: int) -> bool:
+    return size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+# ===================== /start =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_user(update, "started bot")
-    users.get_or_create(update.effective_user.id)
-    context.user_data.clear()
-    context.user_data["lang"] = "en"
-
-    await reset_ui(
-        update,
-        context,
-        TEXT["en"]["welcome"],
-        reply_markup=lang_kb()
-    )
-    return LANG
-
-# ===================== LANGUAGE =====================
-
-async def set_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    lang = q.data.split("_")[1]
-    users.set_language(q.from_user.id, lang)
-    context.user_data["lang"] = lang
-
-    await update_ui(
-        update,
-        context,
-        TEXT[lang]["menu_title"],
-        reply_markup=main_menu(lang)
-    )
-    return MENU
-
-# ===================== MENU =====================
-
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    lang = context.user_data["lang"]
-
-    if q.data == "create":
-        context.user_data["images"] = []
-        await update_ui(update, context, TEXT[lang]["collect_images"], collect_kb(lang))
-        return COLLECT
-
-    if q.data == "files":
-        return await show_files(update, context)
-
-    if q.data == "settings":
-        await update_ui(update, context, TEXT[lang]["choose_language"], lang_kb())
-        return SETTINGS_MENU
-
-    if q.data in ("back_menu", "files"):
-        await update_ui(update, context, TEXT[lang]["menu_title"], main_menu(lang))
-        return MENU
-
-# ===================== FILE LIST =====================
-
-async def show_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_user(update, "opened My Files")
-    lang = context.user_data["lang"]
     user = users.get_or_create(update.effective_user.id)
-    items = files.list(user["id"])
+    log.info("START | user=%s", user["id"])
+
+    await reset_ui(update, context)
+    drafts.delete(user["id"])
+    context.user_data.clear()
+
+    if user["language"] == "en":
+        await show_ui(
+            update,
+            context,
+            "🌐 Choose language / Tilni tanlang / Выберите язык",
+            reply_markup=language_kb(),
+            force_new=True,
+        )
+        return
+
+    lang = user["language"]
+    await show_ui(
+        update,
+        context,
+        TEXT[lang]["welcome"],
+        reply_markup=main_menu(lang),
+        force_new=True,
+    )
+
+
+# ===================== FILE HANDLER =====================
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = users.get_or_create(update.effective_user.id)
+    lang = get_lang(user)
+
+    doc = update.message.document
+    photo = update.message.photo[-1] if update.message.photo else None
+
+    tg_file = doc or photo
+    file_name = doc.file_name if doc else "image.jpg"
+    file_size = doc.file_size if doc else photo.file_size
+
+    log.info("FILE | user=%s | name=%s | size=%s", user["id"], file_name, file_size)
+
+    if file_too_large(file_size):
+        await show_temp(update, context, TEXT[lang]["error_file_too_large"])
+        return
+
+    if not (is_supported_image(file_name) or is_supported_pdf(file_name)):
+        await show_temp(update, context, TEXT[lang]["error_file_type"])
+        return
+
+    draft = drafts.get(user["id"]) or drafts.create(user["id"])
+    log.info("DRAFT ACTIVE | id=%s", draft["id"])
+
+    downloading_id = await show_temp(update, context, TEXT[lang]["file_downloading"])
+
+    tg = await tg_file.get_file()
+    local_path = os.path.join(
+        STORAGE_TEMP,
+        f"{user['id']}_{datetime.now().timestamp()}_{file_name}"
+    )
+    await tg.download_to_drive(local_path)
+
+    await delete_temp(update, context, downloading_id)
+
+    file_type = "pdf" if is_supported_pdf(file_name) else "image"
+
+    draft_items.add(
+        draft_id=draft["id"],
+        file_path=local_path,
+        file_type=file_type,
+        size_bytes=file_size,
+    )
+
+    count = len(draft_items.list(draft["id"]))
+    log.info("DRAFT ADD | items=%s", count)
+
+    old_temp_id = context.user_data.pop("file_added_temp_id", None)
+    if old_temp_id:
+        await delete_temp(update, context, old_temp_id)
+
+    # показать новое
+    temp_id = await show_temp(
+        update,
+        context,
+        TEXT[lang]["file_added_temp"].format(count=count),
+    )
+
+    context.user_data["file_added_temp_id"] = temp_id
+
+
+# ===================== TEXT HANDLER =====================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = users.get_or_create(update.effective_user.id)
+    lang = get_lang(user)
+    text = update.message.text.strip()
+
+    log.info("TEXT | user=%s | text='%s'", user["id"], text)
+
+    rename_id = context.user_data.get("rename_file_id")
+    if rename_id:
+        files.rename(rename_id, user["id"], text)
+        context.user_data.pop("rename_file_id", None)
+
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["file_renamed"],
+            reply_markup=main_menu(lang),
+            force_new=True,
+        )
+        return
+
+    draft = drafts.get(user["id"])
+
+    if not draft:
+        await bump_ui(update, context)
+        return
+
+    items = draft_items.list(draft["id"])
 
     if not items:
-        await update_ui(update, context, TEXT[lang]["no_files"], main_menu(lang))
-        return MENU
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["draft_empty"],
+            reply_markup=main_menu(lang),
+        )
+        return
 
-    text = TEXT[lang]["your_files"] + "\n\n"
-    for f in items:
-        text += f"📄 {f['original_name']} (ID {f['id']})\n"
+    name = text or auto_name()
+    stored_name = f"{int(datetime.now().timestamp())}.pdf"
+    output_path = os.path.join(STORAGE_PDF, stored_name)
 
-    await update_ui(
+    temp_id = context.user_data.pop("file_added_temp_id", None)
+    if temp_id:
+        await delete_temp(update, context, temp_id)
+
+    log.info("PDF BUILD | items=%s | name=%s", len(items), name)
+
+    building_id = await show_temp(
         update,
         context,
-        text,
-        reply_markup=files_list_kb(items, lang)
+        TEXT[lang]["pdf_building"],
     )
-    return FILES_MENU
 
-# ===================== COLLECT IMAGES =====================
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("images", [])
-
-    file = await update.message.photo[-1].get_file()
-    path = os.path.join(
-        STORAGE_TEMP,
-        f"{update.effective_user.id}_{len(context.user_data['images'])}.jpg"
+    PDFService.build_pdf(
+        items=items,
+        output_path=output_path,
+        page_format=draft["page_format"],
     )
-    await file.download_to_drive(path)
-    context.user_data["images"].append(path)
 
-async def collect_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    lang = context.user_data["lang"]
+    files.create(
+        user_id=user["id"],
+        original_name=name,
+        stored_name=stored_name,
+        file_type="pdf",
+        page_format=draft["page_format"],
+        size_bytes=os.path.getsize(output_path),
+    )
 
-    if q.data == "done":
-        if not context.user_data.get("images"):
-            await update_ui(update, context, TEXT[lang]["no_images"], main_menu(lang))
-            return MENU
-        await update_ui(update, context, TEXT[lang]["enter_pdf_name"])
-        return NAME
+    drafts.delete(user["id"])
+    log.info("DRAFT CLOSED")
 
-    if q.data == "cancel":
-        context.user_data.pop("images", None)
-        await update_ui(update, context, TEXT[lang]["cancelled"], main_menu(lang))
-        return MENU
+    await delete_temp(update, context, building_id)
 
-# ===================== CREATE PDF =====================
-
-async def create_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_user(update, f"created PDF '{update.message.text.strip()}'")
-    lang = context.user_data["lang"]
-    name = update.message.text.strip()
-    user = users.get_or_create(update.effective_user.id)
-
-    file_id = files.create(user["id"], name, "")
-    stored = f"{file_id:06}.pdf"
-    pdf_path = os.path.join(STORAGE_PDF, stored)
-
-    PDFService.images_to_pdf(context.user_data["images"], pdf_path)
-    files.set_stored_name(file_id, stored)
+    sending_id = await show_temp(
+        update,
+        context,
+        TEXT[lang]["pdf_sending"],
+    )
 
     await update.message.reply_document(
-        document=open(pdf_path, "rb"),
+        document=open(output_path, "rb"),
         filename=f"{name}.pdf",
-        caption=TEXT[lang]["pdf_created"]
     )
 
-    for img in context.user_data["images"]:
-        try:
-            os.remove(img)
-        except FileNotFoundError:
-            pass
+    await delete_temp(update, context, sending_id)
 
-    context.user_data["images"] = []
-
-    await reset_ui(update, context, TEXT[lang]["menu_title"], main_menu(lang))
-    return MENU
-
-# ===================== FILE CRUD =====================
-
-async def file_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fid = int(update.callback_query.data.split("_")[1])
-    log_user(update, f"selected file #{fid}")
-    q = update.callback_query
-    await q.answer()
-    lang = context.user_data["lang"]
-
-    fid = int(q.data.split("_")[1])
-    file = files.get(fid, users.get_or_create(q.from_user.id)["id"])
-
-    if not file:
-        await reset_ui(update, context, TEXT[lang]["file_not_found"], main_menu(lang))
-        return MENU
-
-    await update_ui(
+    await show_ui(
         update,
         context,
-        f"📄 {file['original_name']}",
-        file_actions_kb(fid, lang)
-    )
-    return FILES_MENU
-
-async def file_download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fid = int(update.callback_query.data.split("_")[1])
-    log_user(update, f"downloaded file #{fid}")
-    q = update.callback_query
-    await q.answer()
-    lang = context.user_data["lang"]
-
-    fid = int(q.data.split("_")[1])
-    user = users.get_or_create(q.from_user.id)
-    file = files.get(fid, user["id"])
-
-    if not file or not file["stored_name"]:
-        await reset_ui(update, context, TEXT[lang]["error"], main_menu(lang))
-        return MENU
-
-    path = os.path.join(STORAGE_PDF, file["stored_name"])
-    if not os.path.exists(path):
-        await reset_ui(update, context, TEXT[lang]["error"], main_menu(lang))
-        return MENU
-
-    await q.message.reply_document(
-        document=open(path, "rb"),
-        filename=f"{file['original_name']}.pdf"
+        TEXT[lang]["pdf_created"],
+        reply_markup=main_menu(lang),
+        force_new=True,
     )
 
-    await reset_ui(update, context, TEXT[lang]["menu_title"], main_menu(lang))
-    return MENU
 
-async def file_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== CALLBACKS =====================
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    lang = context.user_data["lang"]
+
+    context.user_data["ui_message_id"] = q.message.message_id
 
     user = users.get_or_create(q.from_user.id)
-    fid = int(q.data.split("_")[1])
-    file = files.get(fid, user["id"])
+    lang = get_lang(user)
+    data = q.data
 
-    if file and file["stored_name"]:
-        try:
-            os.remove(os.path.join(STORAGE_PDF, file["stored_name"]))
-        except FileNotFoundError:
-            pass
+    log.info("CALLBACK | user=%s | data=%s", user["id"], data)
 
-    files.delete(fid, user["id"])
-    return await show_files(update, context)
+    if data == "back_menu":
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["menu_title"],
+            reply_markup=main_menu(lang),
+        )
+        return
 
-# ===================== RENAME =====================
+    if data == "settings":
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["choose_lang"],
+            reply_markup=language_kb(),
+        )
+        return
 
-async def rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    context.user_data["rename_id"] = int(q.data.split("_")[1])
+    if data.startswith("lang_"):
+        new_lang = data.split("_")[1]
+        users.set_language(user["telegram_id"], new_lang)
 
-    await update_ui(update, context, TEXT[context.user_data["lang"]]["rename"] + ":")
-    return RENAME
+        await show_ui(
+            update,
+            context,
+            TEXT[new_lang]["welcome"],
+            reply_markup=main_menu(new_lang),
+        )
+        return
 
-async def rename_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_user(update, "renamed file")
-    fid = context.user_data.pop("rename_id")
-    user = users.get_or_create(update.effective_user.id)
+    if data == "files":
+        total = files.count(user["id"])
 
-    files.rename(fid, user["id"], update.message.text.strip())
+        if total == 0:
+            await show_ui(
+                update,
+                context,
+                TEXT[lang]["no_files"],
+                reply_markup=main_menu(lang),
+            )
+            return
 
-    await reset_ui(
-        update,
-        context,
-        TEXT[context.user_data["lang"]]["file_renamed"],
-        main_menu(context.user_data["lang"])
-    )
-    return MENU
+        PAGE_SIZE = 5
+        page = 1
+        pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        items = files.list_paginated(user["id"], page)
 
-# ===================== MERGE =====================
+        start = (page - 1) * PAGE_SIZE + 1
+        end = min(page * PAGE_SIZE, total)
 
-async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    context.user_data["merge_ids"] = set()
-    return await merge_show(update, context)
+        title = f"{TEXT[lang]['files_title']} ({start}–{end} из {total})"
 
-async def merge_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    fid = int(q.data.split("_")[2])
+        await show_ui(
+            update,
+            context,
+            title,
+            reply_markup=files_list_kb(items, lang, page, pages),
+        )
+        return
 
-    context.user_data.setdefault("merge_ids", set())
-    context.user_data["merge_ids"].symmetric_difference_update({fid})
-    return await merge_show(update, context)
+    if data.startswith("files_page_"):
+        page = int(data.split("_")[-1])
+        total = files.count(user["id"])
 
-async def merge_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = context.user_data["lang"]
-    context.user_data.setdefault("merge_ids", set())
+        if total == 0:
+            await show_ui(
+                update,
+                context,
+                TEXT[lang]["no_files"],
+                reply_markup=main_menu(lang),
+            )
+            return
 
-    user = users.get_or_create(update.effective_user.id)
-    items = files.list(user["id"])
+        PAGE_SIZE = 5
+        pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        items = files.list_paginated(user["id"], page)
 
-    await update_ui(
-        update,
-        context,
-        TEXT[lang]["merge_select"],
-        merge_files_kb(items, context.user_data["merge_ids"], lang)
-    )
-    return MERGE_SELECT
+        start = (page - 1) * PAGE_SIZE + 1
+        end = min(page * PAGE_SIZE, total)
 
-async def merge_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ids = list(context.user_data.get("merge_ids", []))
-    log_user(update, f"merged files {ids}")
-    q = update.callback_query
-    await q.answer()
+        title = f"{TEXT[lang]['files_title']} ({start}–{end} из {total})"
 
-    lang = context.user_data["lang"]
-    ids = list(context.user_data.get("merge_ids", []))
-    user = users.get_or_create(q.from_user.id)
+        await show_ui(
+            update,
+            context,
+            title,
+            reply_markup=files_list_kb(items, lang, page, pages),
+        )
+        return
 
-    if len(ids) < 2:
-        return await merge_show(update, context)
+    if data.startswith("file_"):
+        fid = int(data.split("_")[1])
+        file = files.get(fid, user["id"])
 
-    paths = files.get_paths(ids, user["id"])
+        if not file:
+            await show_ui(
+                update,
+                context,
+                TEXT[lang]["error_file_not_found"],
+                reply_markup=main_menu(lang),
+            )
+            return
 
-    fid = files.create(user["id"], "Merged PDF", "")
-    stored = f"{fid:06}.pdf"
-    out = os.path.join(STORAGE_PDF, stored)
+        await show_ui(
+            update,
+            context,
+            f"📄 {file['original_name']}",
+            reply_markup=file_actions_kb(fid, lang),
+        )
+        return
 
-    PDFService.merge_pdfs(paths, out)
-    files.set_stored_name(fid, stored)
+    if data.startswith("rename_"):
+        fid = int(data.split("_")[1])
+        context.user_data["rename_file_id"] = fid
 
-    context.user_data.pop("merge_ids", None)
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["rename_prompt"],
+        )
+        return
 
-    await reset_ui(update, context, TEXT[lang]["pdf_created"], main_menu(lang))
-    return MENU
+    if data.startswith("download_"):
+        fid = int(data.split("_")[1])
+        file = files.get(fid, user["id"])
+
+        await show_temp(update, context, TEXT[lang]["pdf_sending"])
+
+        await q.message.reply_document(
+            document=open(os.path.join(STORAGE_PDF, file["stored_name"]), "rb"),
+            filename=f"{file['original_name']}.pdf",
+        )
+
+        await reset_ui(update, context)
+
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["menu_title"],
+            reply_markup=main_menu(lang),
+        )
+        return
+
+    if data.startswith("delete_"):
+        fid = int(data.split("_")[1])
+        files.delete(fid, user["id"])
+
+        await show_ui(
+            update,
+            context,
+            TEXT[lang]["file_deleted"],
+            reply_markup=main_menu(lang),
+            force_new=True,
+        )
+        return
+
 
 # ===================== MAIN =====================
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            LANG: [CallbackQueryHandler(set_lang)],
-            MENU: [CallbackQueryHandler(menu_handler)],
-            COLLECT: [
-                MessageHandler(filters.PHOTO, photo_handler),
-                CallbackQueryHandler(collect_actions),
-            ],
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_pdf)],
-            FILES_MENU: [
-                CallbackQueryHandler(rename_start, pattern="^rename_"),
-                CallbackQueryHandler(merge_start, pattern="^merge_start$"),
-                CallbackQueryHandler(file_select_handler, pattern="^file_"),
-                CallbackQueryHandler(file_download_handler, pattern="^download_"),
-                CallbackQueryHandler(file_delete_handler, pattern="^delete_"),
-                CallbackQueryHandler(menu_handler),
-            ],
-            RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rename_apply)],
-            MERGE_SELECT: [
-                CallbackQueryHandler(merge_toggle, pattern="^merge_toggle_"),
-                CallbackQueryHandler(merge_done, pattern="^merge_done$"),
-                CallbackQueryHandler(menu_handler, pattern="^back_menu$"),
-            ],
-            SETTINGS_MENU: [CallbackQueryHandler(set_lang)],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True,
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.add_handler(conv)
+    log.info("🚀 BOT STARTED (single-message UI)")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
